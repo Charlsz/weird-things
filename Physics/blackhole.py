@@ -464,7 +464,7 @@ class Widget(QtWidgets.QWidget):
                 ys_acc_disk_2nd.append(np.array([]))
         
         # Light ray at critical impact parameter
-        x_init = self.spinBoxm4.value()
+        x_init = -40
         max_t = 100.
         b_min = 3*np.sqrt(3)*M
         b_max = 3*np.sqrt(3)*M
