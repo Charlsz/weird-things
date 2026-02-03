@@ -1,438 +1,636 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
+"""
+Black Hole Photon Orbit Visualizer with PyQt5 Interface
+Real-time visualization of null geodesics in Schwarzschild spacetime
+with accretion disk rendering
+"""
+
+import warnings
+warnings.filterwarnings('ignore')
 import numpy as np
-from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import sys
+import matplotlib
+matplotlib.use('Qt5Agg')
+from PyQt5 import QtCore, QtWidgets, QtGui
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from scipy.integrate import odeint
+import seaborn as sns
+from scipy.interpolate import interp1d
+from scipy.special import ellipj, ellipkinc, ellipk
+from scipy.optimize import fsolve
 
-# ----------------------------------------------------------------------
-#  Physical constants (SI)
-# ----------------------------------------------------------------------
-G = 6.67430e-11            # m³ kg⁻¹ s⁻²
-c = 299_792_458.0          # m s⁻¹
+# ============================================================
+#  NULL GEODESIC EQUATIONS (Light Ray Tracing)
+# ============================================================
 
-# ----------------------------------------------------------------------
-#  Helper functions
-# ----------------------------------------------------------------------
-def schwarzschild_radius(M_kg: float) -> float:
+def S_null(Z, t, p):
     """
-    Schwarzschild radius rs = 2 G M / c²  (meters)
-
-    Parameters
-    ----------
-    M_kg : float
-        Mass of the black hole in kilograms.
-
-    Returns
-    -------
-    float
-        rs in meters.
+    System of ODEs for null geodesics in Schwarzschild metric
+    Z = [r, rdot, phi]
+    p = [M, L] where M is mass and L is angular momentum
     """
-    return 2.0 * G * M_kg / c**2
+    r, rdot, phi = Z
+    M, L = p
+    phidot = L / r**2
+    return [
+        rdot,
+        L**2 * (r - 3*M) / r**4,
+        phidot
+    ]
 
 
-# ----------------------------------------------------------------------
-#  Schwarzschild black hole class
-# ----------------------------------------------------------------------
-class SchwarzschildBlackHole:
+def init_cond(b, x_init):
     """
-    Encapsulates a static, spherically symmetric (Schwarzschild) BH.
-    All motion is restricted to the equatorial plane θ = π/2.
+    Initial conditions for a photon with impact parameter b
+    starting at position x_init
     """
+    r_init = np.sqrt(b**2 + x_init**2)
+    phi_init = np.arccos(x_init / r_init)
+    rdot_init = np.cos(phi_init)
+    phidot_init = -np.sqrt((1 - rdot_init**2) / r_init**2)
+    L = r_init**2 * phidot_init
+    return [r_init, rdot_init, phi_init], L
 
-    def __init__(self, mass_kg: float):
+
+def integrate(t, initial, p):
+    """
+    Integrate the geodesic equations
+    """
+    sol = odeint(S_null, initial, t, args=(p,))
+    r = sol[:, 0]
+    phi = sol[:, 2]
+    return r, phi
+
+
+# ============================================================
+#  ACCRETION DISK ISORADIAL CURVES (Elliptic Functions)
+# ============================================================
+
+def B_fun(p, M):
+    """Impact parameter as function of orbital radius"""
+    return (p**3 / (p - 2*M))**0.5
+
+
+def Q_fun(P, M):
+    """Q parameter for elliptic integrals"""
+    return ((P - 2*M) * (P + 6*M))**0.5
+
+
+def gamma(alpha, theta_0):
+    """Angle transformation for observer inclination"""
+    a = np.cos(alpha)**2 + 1 / (np.tan(theta_0)**(2))
+    return np.arccos(np.cos(alpha) / (a**0.5))
+
+
+def k2(P, M):
+    """Elliptic modulus squared"""
+    Q = Q_fun(P, M)
+    return ((Q - P + 6*M) / (2*Q))
+
+
+def zeta_inf(P, M):
+    """Asymptotic angle for elliptic integral"""
+    Q = Q_fun(P, M)
+    ratio = (Q - P + 2*M) / (Q - P + 6*M)
+    return np.arcsin(ratio**0.5)
+
+
+def Up(P, alpha, M, theta_0):
+    """
+    First order image: 1/r as function of angle
+    Using Jacobi elliptic functions
+    """
+    Q = Q_fun(P, M)
+    A1 = (Q - P + 2*M) / (4*M*P)
+    A2 = (Q - P + 6*M) / (4*M*P)
+    g = gamma(alpha, theta_0)
+    ratio = (Q / P)**0.5
+    mod = k2(P, M)
+    sn, cn, dn, ph = ellipj(((g/2)*ratio + ellipkinc(zeta_inf(P, M), mod)), mod)
+    return -A1 + A2*sn**2
+
+
+def Up2(P, alpha, M, theta_0):
+    """
+    Second order image: photons that circle the BH before reaching observer
+    """
+    Q = Q_fun(P, M)
+    A1 = (Q - P + 2*M) / (4*M*P)
+    A2 = (Q - P + 6*M) / (4*M*P)
+    g = gamma(alpha, theta_0)
+    ratio = (Q / P)**0.5
+    mod = k2(P, M)
+    sn, cn, dn, ph = ellipj((0.5*(g-2*np.pi)*ratio + 2*ellipk(mod) - 
+                             ellipkinc(zeta_inf(P, M), mod)), mod)
+    return -A1 + A2*sn**2
+
+
+# ============================================================
+#  PLOTTING FUNCTION
+# ============================================================
+
+def plot_solution(self, fig, x_1, y_1, xs_acc_disk, ys_acc_disk, 
+                 xs_acc_disk_2nd, ys_acc_disk_2nd, angle_disk, 
+                 accret_disk_min_r, accret_disk_max_r, M, t):
+    """
+    Create the two-panel visualization:
+    Left: Geodesics with accretion disk
+    Right: Observer view of accretion disk
+    """
+    
+    # Left panel: Geodesics
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax1.grid(False)
+    
+    # Draw accretion disk line
+    x_disk_plus = np.arange(accret_disk_min_r, accret_disk_max_r, 0.05)
+    x_disk_minus = np.arange(-accret_disk_max_r, -accret_disk_min_r, 0.05)
+    
+    # Check which photons hit the disk
+    for i in range(len(x_1)):
+        attempts = 0
+        hit_disk = False
+        
+        # Check positive side
+        for j in range(len(x_disk_plus)):
+            attempts += 1
+            d = np.sqrt((x_1[i] - x_disk_plus[j])**2 + 
+                       (y_1[i] - x_disk_plus[j]*np.tan(angle_disk))**2)
+            if np.min(d) < 0.1:
+                idx = j
+                plt.scatter(x_disk_plus[idx], x_disk_plus[idx]*np.tan(angle_disk), 
+                          color='black', s=20)
+                line_hit, = plt.plot(x_1[i], y_1[i], color='blue', linewidth=1.5)
+                hit_disk = True
+                break
+        
+        # Check negative side
+        attempts_2 = 0
+        if not hit_disk:
+            for j in range(len(x_disk_minus)):
+                attempts_2 += 1
+                d = np.sqrt((x_1[i] - x_disk_minus[j])**2 + 
+                           (y_1[i] - x_disk_minus[j]*np.tan(angle_disk))**2)
+                if np.min(d) < 0.1:
+                    idx = j
+                    plt.scatter(x_disk_minus[idx], x_disk_minus[idx]*np.tan(angle_disk), 
+                              color='black', s=20)
+                    plt.plot(x_1[i], y_1[i], color='blue', linewidth=1.5)
+                    hit_disk = True
+                    break
+        
+        # If didn't hit disk
+        if not hit_disk:
+            line_fail, = plt.plot(x_1[i], y_1[i], color='lightgrey', linewidth=1)
+    
+    # Draw black hole horizon
+    circle = plt.Circle((0., 0.), 2*M, color='black', fill=True, zorder=10)
+    plt.gca().add_patch(circle)
+    
+    # Draw accretion disk
+    plt.plot(x_disk_plus, x_disk_plus*np.tan(angle_disk), color='red', linewidth=2)
+    plt.plot(x_disk_minus, x_disk_minus*np.tan(angle_disk), color='red', linewidth=2)
+    
+    # Labels and styling
+    plt.xlabel(r"Distance $X$", fontsize=10, color='white')
+    plt.ylabel(r"Distance $Z$", fontsize=10, color='white')
+    plt.yticks(color='white')
+    plt.xticks(color='white')
+    plt.axis('equal')
+    
+    # Legend
+    try:
+        ax1.legend(handles=[line_hit, line_fail], 
+                  labels=['Accretion disk hit', 'Off to infinity or captured'], 
+                  loc='upper right')
+    except UnboundLocalError:
+        print('All lightrays either hit the accretion disk or miss it.')
+    
+    ax1.set_xlim(-20, 20)
+    ax1.set_xbound(-20, 20)
+    ax1.set_ylim(-20, 20)
+    ax1.set_ybound(-20, 20)
+    ax1.set_title(r"Lightlike geodesics for" "\n" 
+                 r"$ds^2 = -(1-2M/r) \ dt^2 + (1 - 2M/r)^{-1}dr^2 + r^2 d\Omega^2$",
+                 fontsize=12, color='white')
+    
+    # Right panel: Accretion disk view
+    ax2 = fig.add_subplot(1, 2, 2)
+    ax2.grid(False)
+    
+    # Draw isoradial curves with hot colormap
+    for i in range(len(xs_acc_disk)):
+        x = xs_acc_disk[i]
+        y = ys_acc_disk[i]
+        x2 = xs_acc_disk_2nd[i]
+        y2 = ys_acc_disk_2nd[i]
+        
+        # Interpolate for smooth curves at high inclinations
+        if np.pi/2 - angle_disk < 78*np.pi/180:
+            if i > 3 and len(y) > 40:
+                try:
+                    x_interp = np.concatenate((y[-20:-10], y[10:20]))
+                    y_interp = np.concatenate((-x[-20:-10], -x[10:20]))
+                    f = interp1d(x_interp, y_interp, kind='quadratic')
+                    x_new = np.linspace(y[-10], y[10], 100)
+                    plt.plot(x_new, f(x_new), 
+                           color=sns.color_palette('hot_r', len(xs_acc_disk))[i],
+                           zorder=2, lw=4)
+                except:
+                    pass
+        
+        # Second order images
+        if len(y2) > 0 and len(x2) > 0:
+            plt.plot(y2, x2, color=sns.color_palette('hot_r', len(xs_acc_disk))[i],
+                    zorder=1, lw=4)
+        
+        # First order images
+        if len(y) > 0 and len(x) > 0:
+            plt.plot(y, -x, color=sns.color_palette('hot_r', len(xs_acc_disk))[i],
+                    zorder=2, lw=4)
+    
+    # Black hole and photon sphere
+    circle = plt.Circle((0., 0.), 2*M, color='black', fill=True, zorder=100)
+    plt.gca().add_patch(circle)
+    circle = plt.Circle((0., 0.), 3*M, color='black', fill=True, zorder=99, alpha=0.3)
+    plt.gca().add_patch(circle)
+    circle = plt.Circle((0., 0.), np.sqrt(3)*3*M, facecolor='none', 
+                       edgecolor='white', fill=False, zorder=98, lw=4)
+    plt.gca().add_patch(circle)
+    
+    ax2.set_xlim(-32, 32)
+    ax2.set_ylim(-32, 32)
+    ax2.axis('off')
+    fig.patch.set_color('dimgrey')
+    for ax in fig.axes:
+        ax.patch.set_color('dimgrey')
+    ax2.set_title(f'Black hole accretion disk view at {int((np.pi/2 - angle_disk)*180/np.pi)}º', 
+                 fontsize=14, color='white')
+    
+    print('Done! Check your plots :)')
+
+
+# ============================================================
+#  PyQt5 GUI WIDGET
+# ============================================================
+
+class Widget(QtWidgets.QWidget):
+    def __init__(self, *args, **kwargs):
+        QtWidgets.QWidget.__init__(self, *args, **kwargs)
+        
+        # Create matplotlib figure
+        global fig
+        fig = plt.figure(figsize=(12, 6), dpi=100)
+        fig.set_facecolor('#1a1a1a')
+        self.figure = fig
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setSizePolicy(QtWidgets.QSizePolicy.Expanding, 
+                                 QtWidgets.QSizePolicy.Expanding)
+        
+        # Main layout
+        main_layout = QtWidgets.QVBoxLayout(self)
+        
+        # Title
+        title = QtWidgets.QLabel("BLACK HOLE SIMULATOR")
+        title.setStyleSheet("""
+            color: white;
+            font-size: 24px;
+            font-weight: bold;
+            padding: 15px;
+            background-color: #2a2a2a;
+            border-radius: 5px;
+        """)
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        main_layout.addWidget(title)
+        
+        # Canvas
+        main_layout.addWidget(self.canvas)
+        
+        # Simple controls
+        control_panel = QtWidgets.QWidget()
+        control_panel.setStyleSheet("background-color: #2a2a2a; padding: 10px; border-radius: 5px;")
+        control_layout = QtWidgets.QGridLayout()
+        
+        # Number of photons
+        photon_label = QtWidgets.QLabel("Number of Photons:")
+        photon_label.setStyleSheet("color: white; font-size: 14px;")
+        self.photon_spin = QtWidgets.QSpinBox()
+        self.photon_spin.setRange(1, 50)
+        self.photon_spin.setValue(10)
+        self.photon_spin.setStyleSheet("""
+            QSpinBox {
+                background-color: #3a3a3a;
+                color: white;
+                font-size: 14px;
+                padding: 5px;
+                border: 1px solid #555;
+                border-radius: 3px;
+            }
+        """)
+        
+        control_layout.addWidget(photon_label, 0, 0)
+        control_layout.addWidget(self.photon_spin, 0, 1)
+        
+        # View angle
+        angle_label = QtWidgets.QLabel("View Angle (degrees):")
+        angle_label.setStyleSheet("color: white; font-size: 14px;")
+        self.angle_spin = QtWidgets.QSpinBox()
+        self.angle_spin.setRange(0, 85)
+        self.angle_spin.setValue(20)
+        self.angle_spin.setStyleSheet("""
+            QSpinBox {
+                background-color: #3a3a3a;
+                color: white;
+                font-size: 14px;
+                padding: 5px;
+                border: 1px solid #555;
+                border-radius: 3px;
+            }
+        """)
+        
+        control_layout.addWidget(angle_label, 1, 0)
+        control_layout.addWidget(self.angle_spin, 1, 1)
+        
+        # Buttons
+        btn_run = QtWidgets.QPushButton("RUN SIMULATION")
+        btn_run.clicked.connect(self.main)
+        btn_run.setStyleSheet("""
+            QPushButton {
+                background-color: #4a4a4a;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 10px 20px;
+                border: 1px solid #666;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #5a5a5a;
+            }
+        """)
+        
+        btn_stop = QtWidgets.QPushButton("STOP")
+        btn_stop.clicked.connect(self.stop)
+        btn_stop.setStyleSheet("""
+            QPushButton {
+                background-color: #4a4a4a;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 10px 20px;
+                border: 1px solid #666;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #5a5a5a;
+            }
+        """)
+        
+        control_layout.addWidget(btn_run, 2, 0)
+        control_layout.addWidget(btn_stop, 2, 1)
+        
+        control_panel.setLayout(control_layout)
+        main_layout.addWidget(control_panel)
+        
+        self.setStyleSheet("background-color: #1a1a1a;")
+    
+    def case(self, text):
+        """Handle predefined cases"""
+        if text == "Critical Loop":
+            self.Loop()
+    
+    def stop(self):
+        """Stop the current simulation"""
+        try:
+            global ani
+            ani.event_source.stop()
+            ani.frame_seq = ani.new_frame_seq()
+        except:
+            pass
+    
+    def Loop(self):
         """
-        Parameters
-        ----------
-        mass_kg : float
-            Black‑hole mass in kilograms.
+        Predefined case: critical impact parameter
+        Shows photon orbiting many times before capture/escape
         """
-        self.M = mass_kg                            # kg
-        self.rs = schwarzschild_radius(mass_kg)     # meters
-
-    # ------------------------------------------------------------------
-    #  Conserved quantities for a circular timelike orbit
-    # ------------------------------------------------------------------
-    def circular_orbit_E_L(self, r: float):
+        self.figure.clear()
+        M = 1
+        angle_disk = 0
+        theta_0 = np.pi/2
+        accret_disk_min_r = 6*M
+        accret_disk_max_r = 15*M
+        r_list = np.arange(4, 30, 0.5)*M
+        b_c = 3*np.sqrt(3)*M
+        xs_acc_disk = []
+        ys_acc_disk = []
+        xs_acc_disk_2nd = []
+        ys_acc_disk_2nd = []
+        
+        print("Computing isoradial curves... (this may take a moment)")
+        
+        # Compute isoradial curves (simplified for speed)
+        for idx, r in enumerate(r_list[::2]):  # Skip some for speed
+            alpha_list = np.arange(0, 4*np.pi, 0.05)
+            b_list = []
+            alpha_res = []
+            
+            for alpha in alpha_list:
+                def cu(P, M, theta_0):
+                    return 1 - r*Up(P, alpha, M, theta_0)
+                
+                guess = b_c + 0.1
+                try:
+                    raiz = fsolve(cu, [guess], args=(M, theta_0), full_output=False)[0]
+                    if abs(raiz - guess) > 0.01:
+                        b_raiz = B_fun(raiz, M)
+                        if b_raiz > 0 and b_raiz < 100:
+                            b_list.append(b_raiz)
+                            alpha_res.append(alpha)
+                except:
+                    pass
+            
+            if len(b_list) > 0:
+                b_array = np.array(b_list)
+                alpha_array = np.array(alpha_res)
+                x = b_array * np.cos(alpha_array)
+                y = b_array * np.sin(alpha_array)
+                xs_acc_disk.append(x)
+                ys_acc_disk.append(y)
+                xs_acc_disk_2nd.append(np.array([]))
+                ys_acc_disk_2nd.append(np.array([]))
+        
+        # Light ray at critical impact parameter
+        x_init = self.spinBoxm4.value()
+        max_t = 100.
+        b_min = 3*np.sqrt(3)*M
+        b_max = 3*np.sqrt(3)*M
+        b_num = 1
+        b_list = np.linspace(b_min, b_max, int(b_num))
+        t = np.arange(0, max_t, 0.01)
+        
+        xs = []
+        ys = []
+        for j, b in enumerate(b_list):
+            initial, L = init_cond(b, x_init)
+            r, phi = integrate(t, initial, [M, L])
+            
+            x_1 = r * np.cos(phi)
+            y_1 = r * np.sin(phi)
+            xs.append(x_1)
+            ys.append(y_1)
+        
+        plot_solution(self, fig, xs, ys, xs_acc_disk, ys_acc_disk, 
+                     xs_acc_disk_2nd, ys_acc_disk_2nd, angle_disk, 
+                     accret_disk_min_r, accret_disk_max_r, M, t)
+        self.canvas.draw()
+    
+    def main(self):
         """
-        Exact energy per unit rest mass (E) and angular momentum per unit
-        rest mass (L) of a *stable* circular orbit at radius r (> 3 rs).
-
-        The formulas are (geometrised units G = c = 1, M = rs/2)
-
-            L² = M r / (1 - 3M/r)                (1)
-            E² = (r - 2M)² / ( r (r - 3M) )      (2)
-
-        Converting back to SI gives the same dimensionless numbers;
-        we multiply by the appropriate powers of c to obtain J kg⁻¹ (energy)
-        and m² s⁻¹ (angular momentum).
-
-        Parameters
-        ----------
-        r : float
-            Radius of the circular orbit (meters). Must be > 3 rs.
-
-        Returns
-        -------
-        E : float
-            Conserved energy per unit rest mass (J kg⁻¹).  For a particle at
-            rest at infinity, E = c².
-        L : float
-            Conserved angular momentum per unit rest mass (m² s⁻¹).
+        Main simulation with user-defined parameters
         """
-        if r <= 3 * self.rs:
-            raise ValueError("Circular timelike orbits only exist for r > 3 rs.")
-
-        # Geometrised mass M_geo = G M / c² (has dimensions of length)
-        M_geo = G * self.M / c**2
-        # Formulas (1)–(2) in geometrised units
-        L2_geo = (M_geo * r) / (1.0 - 3.0 * M_geo / r)
-        L_geo = np.sqrt(L2_geo)                      # meters
-        E2_geo = ((r - 2.0 * M_geo) ** 2) / (r * (r - 3.0 * M_geo))
-        E_geo = np.sqrt(E2_geo)                       # dimensionless ( = E / c² )
-
-        # Convert to SI per‑unit‑mass quantities
-        L = L_geo * c                               # m² s⁻¹
-        E = E_geo * c**2                            # J kg⁻¹
-        return E, L
-
-    # ------------------------------------------------------------------
-    #  Timelike (massive) geodesic integrator
-    # ------------------------------------------------------------------
-    def timelike_geodesic(self,
-                         r0: float,
-                         phi0: float = 0.0,
-                         t0: float = 0.0,
-                         E: float = None,
-                         L: float = None,
-                         dr0: float = None,
-                         direction: int = -1,
-                         tau_max: float = 1e5,
-                         max_step: float = None):
-        """
-        Integrate a massive test‑particle trajectory.
-
-        The equations of motion (using proper time τ as the independent
-        variable) are from the Schwarzschild metric with conserved E and L:
-
-            dt/dτ =  E / [ (1 - rs/r) c² ]               (3)
-            dφ/dτ =  L / r²                              (4)
-            (dr/dτ)² =  E²/c² - (1 - rs/r)(c² + L²/r²)   (5)
-
-        For a given (E, L) the sign of dr/dτ is chosen by ``direction`` or,
-        if ``dr0`` is supplied, by its sign.
-
-        Parameters
-        ----------
-        r0 : float
-            Initial radial coordinate (metres).
-        phi0, t0 : float, optional
-            Initial azimuthal angle (rad) and Schwarzschild coordinate time
-            (seconds).  Default to 0.
-        E, L : float, optional
-            Conserved energy and angular momentum per unit rest mass.
-            If omitted the function assumes a *circular* orbit at r0 and
-            computes them from ``circular_orbit_E_L``.
-        dr0 : float, optional
-            Initial proper‑radial velocity dr/dτ (m s⁻¹).  If given, its sign
-            overrides ``direction``.
-        direction : int, optional
-            +1 = outward, -1 = inward.  Used only if ``dr0`` is ``None``.
-        tau_max : float, optional
-            Maximum proper time to integrate (seconds).  The solver stops
-            earlier if the particle crosses the horizon.
-        max_step : float, optional
-            Upper bound on the integration step‑size (seconds).  If omitted
-            it is set automatically to tau_max/5000.
-
-        Returns
-        -------
-        dict
-            Keys ``'tau'``, ``'t'``, ``'r'``, ``'phi'``, ``'E'``, ``'L'``.
-        """
-        # ------------------------------------------------------------------
-        #  Set default conserved quantities (circular orbit) if they are missing
-        # ------------------------------------------------------------------
-        if (E is None) or (L is None):
-            E, L = self.circular_orbit_E_L(r0)
-            # For a perfect circular orbit the radial proper velocity is zero
-            if dr0 is None:
-                dr0 = 0.0
-
-        # ------------------------------------------------------------------
-        #  ODE system in proper time τ
-        # ------------------------------------------------------------------
-        def ode(tau, y):
-            """
-            y = [t, r, phi]
-            Returns dy/dτ.
-            """
-            t, r, phi = y
-            # Guard against entering the singularity
-            if r <= self.rs * 1.000001:
-                # Freeze the solution – the integrator will stop shortly
-                return [0.0, 0.0, 0.0]
-
-            # (1 - rs/r) factor appears often
-            factor = 1.0 - self.rs / r
-
-            # ---- dt/dτ (eq. 3) ----
-            dt_dtau = E / (factor * c**2)
-
-            # ---- dφ/dτ (eq. 4) ----
-            dphi_dtau = L / (r**2)
-
-            # ---- (dr/dτ)² (eq. 5) ----
-            radicand = (E**2) / (c**2) - factor * (c**2 + L**2 / (r**2))
-
-            # If the radicand becomes negative the particle has reached a
-            # turning point.  We set dr/dτ = 0 there – the sign will be
-            # determined by the next step (the solver is adaptive enough).
-            if radicand < 0.0:
-                dr_dtau = 0.0
+        self.figure.clear()
+        M = 1
+        angle_disk = self.angle_spin.value() * np.pi / 180
+        theta_0 = np.pi/2 - self.angle_spin.value() * np.pi / 180
+        accret_disk_min_r = 6*M
+        accret_disk_max_r = 15*M
+        r_list = np.arange(4, 30, 0.5)*M
+        b_c = 3*np.sqrt(3)*M
+        xs_acc_disk = []
+        ys_acc_disk = []
+        xs_acc_disk_2nd = []
+        ys_acc_disk_2nd = []
+        
+        print("Computing accretion disk isoradial curves...")
+        
+        # Compute isoradial curves
+        for idx, r in enumerate(r_list[::2]):  # Skip for performance
+            if theta_0 < 78*np.pi/180:
+                alpha_list = np.arange(0, 2*np.pi, 0.05)
             else:
-                # Sign choice – from user supplied dr0 or from generic direction
-                sign = np.sign(dr0) if dr0 is not None else direction
-                dr_dtau = sign * np.sqrt(radicand)
-
-            return [dt_dtau, dr_dtau, dphi_dtau]
-
-        # ------------------------------------------------------------------
-        #  Integration
-        # ------------------------------------------------------------------
-        y0 = [t0, r0, phi0]
-        if max_step is None:
-            max_step = tau_max / 5000.0
-
-        sol = solve_ivp(
-            fun=ode,
-            t_span=(0.0, tau_max),
-            y0=y0,
-            method='RK45',
-            max_step=max_step,
-            rtol=1e-9,
-            atol=1e-12,
-        )
-
-        return {
-            'tau': sol.t,
-            't': sol.y[0],
-            'r': sol.y[1],
-            'phi': sol.y[2],
-            'E': E,
-            'L': L,
-            'r0': r0,
-            'phi0': phi0,
-            't0': t0,
-        }
-
-    # ------------------------------------------------------------------
-    #  Null (photon) geodesic integrator
-    # ------------------------------------------------------------------
-    def null_geodesic(self,
-                      r0: float,
-                      impact_parameter: float,
-                      phi0: float = 0.0,
-                      t0: float = 0.0,
-                      direction: int = -1,
-                      tau_max: float = 1e5,
-                      max_step: float = None):
-        """
-        Integrate a photon trajectory with a given impact parameter b = L/E.
-
-        In the null case the normalization condition g_{μν}u^μu^ν = 0 leads to
-
-            (dr/dτ)² =  E²/c² - (1 - rs/r) L²/r²         (6)
-
-        We fix a convenient scale by setting E = c (units of velocity); then
-        L = b E = b c, where ``b`` is the physical impact parameter
-        (metres).
-
-        Parameters
-        ----------
-        r0 : float
-            Starting radius (usually many rs, e.g. 100 rs).
-        impact_parameter : float
-            b = L/E (metres).  b < 3√3 M (≈ 1.5 rs) leads to capture, larger
-            values are deflected.
-        direction : int, optional
-            -1 = photon moving inward toward the hole, +1 outward.
-        tau_max, max_step : float, optional
-            Same meaning as in ``timelike_geodesic``.
-
-        Returns
-        -------
-        dict with the same keys as ``timelike_geodesic`` (plus ``b``).
-        """
-        # Scale choices (E = c, so L = b c)
-        E = c
-        L = impact_parameter * c
-        b = impact_parameter
-
-        # ------------------------------------------------------------------
-        #  ODE system (null)
-        # ------------------------------------------------------------------
-        def ode(tau, y):
-            t, r, phi = y
-            if r <= self.rs * 1.000001:
-                return [0.0, 0.0, 0.0]
-
-            factor = 1.0 - self.rs / r
-            dt_dtau = E / (factor * c**2)            # same as massive case
-            dphi_dtau = L / (r**2)
-
-            radicand = (E**2) / (c**2) - factor * (L**2) / (r**2)
-            dr_dtau = direction * np.sqrt(radicand) if radicand > 0 else 0.0
-
-            return [dt_dtau, dr_dtau, dphi_dtau]
-
-        y0 = [t0, r0, phi0]
-        if max_step is None:
-            max_step = tau_max / 5000.0
-
-        sol = solve_ivp(
-            fun=ode,
-            t_span=(0.0, tau_max),
-            y0=y0,
-            method='RK45',
-            max_step=max_step,
-            rtol=1e-9,
-            atol=1e-12,
-        )
-
-        return {
-            'tau': sol.t,
-            't': sol.y[0],
-            'r': sol.y[1],
-            'phi': sol.y[2],
-            'E': E,
-            'L': L,
-            'b': b,
-            'r0': r0,
-        }
-
-    # ------------------------------------------------------------------
-    #  Plotting utilities
-    # ------------------------------------------------------------------
-    def plot_trajectory(self,
-                       traj: dict,
-                       ax=None,
-                       show_horizon: bool = True,
-                       label: str = None,
-                       **plot_kwargs):
-        """
-        Plot a trajectory (r, φ) in Cartesian coordinates.
-
-        Parameters
-        ----------
-        traj : dict
-            Output dictionary from ``timelike_geodesic`` or ``null_geodesic``.
-            Must contain ``'r'`` and ``'phi'`` arrays.
-        ax : matplotlib.axes.Axes, optional
-            Axis to draw on.  If omitted, a new figure+axis is created.
-        show_horizon : bool, optional
-            Draw the event horizon as a filled black disc.
-        label : str, optional
-            Legend entry.
-        plot_kwargs : dict
-            Additional arguments passed to ``ax.plot``.
-
-        Returns
-        -------
-        matplotlib.axes.Axes
-        """
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(6, 6))
-
-        # Convert polar → Cartesian
-        x = traj['r'] * np.cos(traj['phi'])
-        y = traj['r'] * np.sin(traj['phi'])
-
-        ax.plot(x, y, label=label, **plot_kwargs)
-
-        if show_horizon:
-            horizon = plt.Circle((0, 0), self.rs, color='black', zorder=10)
-            ax.add_artist(horizon)
-
-        ax.set_aspect('equal')
-        ax.set_xlabel('x (m)')
-        ax.set_ylabel('y (m)')
-        ax.set_title('Geodesic around a Schwarzschild Black Hole')
-        if label is not None:
-            ax.legend()
-        return ax
+                alpha_list = np.arange(0, 4*np.pi, 0.05)
+            
+            b_list = []
+            b_list2 = []
+            alpha_res = []
+            alpha_res2 = []
+            
+            for alpha in alpha_list:
+                # First order
+                def cu(P, M, theta_0):
+                    return 1 - r*Up(P, alpha, M, theta_0)
+                
+                # Second order
+                def cu2(P, M, theta_0):
+                    return -(1 - r*Up2(P, alpha, M, theta_0))
+                
+                guess = b_c + 0.1
+                
+                try:
+                    raiz = fsolve(cu, [guess], args=(M, theta_0))[0]
+                    if abs(raiz - guess) > 0.01:
+                        b_raiz = B_fun(raiz, M)
+                        if b_raiz > 0 and b_raiz < 100:
+                            b_list.append(b_raiz)
+                            alpha_res.append(alpha)
+                except:
+                    pass
+                
+                try:
+                    raiz2 = fsolve(cu2, [guess], args=(M, theta_0))[0]
+                    if abs(raiz2 - guess) > 0.01:
+                        b_raiz2 = B_fun(raiz2, M)
+                        if b_raiz2 > 0 and b_raiz2 < 100:
+                            b_list2.append(b_raiz2)
+                            alpha_res2.append(alpha)
+                except:
+                    pass
+            
+            # First order
+            if len(b_list) > 0:
+                b_array = np.array(b_list)
+                alpha_array = np.array(alpha_res)
+                x = b_array * np.cos(alpha_array)
+                y = b_array * np.sin(alpha_array)
+                xs_acc_disk.append(x)
+                ys_acc_disk.append(y)
+            else:
+                xs_acc_disk.append(np.array([]))
+                ys_acc_disk.append(np.array([]))
+            
+            # Second order
+            if len(b_list2) > 0:
+                b_array2 = np.array(b_list2)
+                alpha_array2 = np.array(alpha_res2)
+                x2 = b_array2 * np.cos(alpha_array2)
+                y2 = b_array2 * np.sin(alpha_array2)
+                
+                # Filter points within view limits
+                xlims = [-32, 32]
+                ylims = [-32, 32]
+                mask = (x2 > xlims[0]) & (x2 < xlims[1]) & (y2 > ylims[0]) & (y2 < ylims[1])
+                x2_filtered = x2[mask]
+                y2_filtered = y2[mask]
+                
+                xs_acc_disk_2nd.append(x2_filtered)
+                ys_acc_disk_2nd.append(y2_filtered)
+            else:
+                xs_acc_disk_2nd.append(np.array([]))
+                ys_acc_disk_2nd.append(np.array([]))
+        
+        print("Tracing light rays...")
+        
+        # Trace light rays
+        x_init = -40
+        max_t = 100.
+        critical = 3*np.sqrt(3)*M
+        b_min = critical - 2
+        b_max = critical + 2
+        b_num = self.photon_spin.value()
+        b_list = np.linspace(b_min, b_max, int(b_num))
+        t = np.arange(0, max_t, 0.01)
+        
+        xs = []
+        ys = []
+        for j, b in enumerate(b_list):
+            initial, L = init_cond(b, x_init)
+            r, phi = integrate(t, initial, [M, L])
+            
+            if b < 0:
+                x_1 = r * np.cos(phi)
+                y_1 = -r * np.sin(phi)
+            else:
+                x_1 = r * np.cos(phi)
+                y_1 = r * np.sin(phi)
+            xs.append(x_1)
+            ys.append(y_1)
+        
+        plot_solution(self, fig, xs, ys, xs_acc_disk, ys_acc_disk, 
+                     xs_acc_disk_2nd, ys_acc_disk_2nd, angle_disk, 
+                     accret_disk_min_r, accret_disk_max_r, M, t)
+        self.canvas.draw()
 
 
-# ----------------------------------------------------------------------
-#  Example usage (run the file directly)
-# ----------------------------------------------------------------------
+# ============================================================
+#  MAIN APPLICATION
+# ============================================================
+
 if __name__ == '__main__':
-    # ------------------------------------------------------------------
-    #  Choose a black‑hole mass
-    # ------------------------------------------------------------------
-    M_sun = 1.98847e30                    # kg
-    M_bh = 10 * M_sun                     # 10‑solar‑mass BH (typical stellar BH)
-    bh = SchwarzschildBlackHole(M_bh)
-
-    print(f"Mass = {M_bh:.3e} kg")
-    print(f"Schwarzschild radius = {bh.rs / 1e3:.3f} km")
-
-    # ------------------------------------------------------------------
-    #  1) Massive particle on a slightly perturbed circular orbit
-    # ------------------------------------------------------------------
-    r_circ = 12.0 * bh.rs                # radius of (approx) circular orbit
-
-    # Exact (E, L) for a perfect circle at r_circ
-    E_circ, L_circ = bh.circular_orbit_E_L(r_circ)
-    print("\nCircular orbit at {:.0f} rs:".format(r_circ / bh.rs))
-    print(f"  Energy per unit mass = {E_circ / c**2:.6f} c²")
-    print(f"  Angular momentum per unit mass = {L_circ:.3e} m² s⁻¹")
-
-    # Perturb L a little to make the orbit elliptical (precessing)
-    L_pert = 0.95 * L_circ
-
-    # Integrate for a proper time of ~ 1 s (for a 10‑M⊙ BH the dynamical time is ≈ 10⁻⁴ s,
-    # so 1 s gives many orbits)
-    traj_massive = bh.timelike_geodesic(
-        r0=r_circ,
-        phi0=0.0,
-        E=E_circ,
-        L=L_pert,
-        dr0=0.0,
-        direction=-1,
-        tau_max=2.0,               # seconds of proper time
-    )
-    # Plot the orbit
-    bh.plot_trajectory(traj_massive, color='tab:blue',
-                        label='massive particle', linewidth=1.5)
-    plt.show()
-
-    # ------------------------------------------------------------------
-    #  2) Photon trajectories with different impact parameters
-    # ------------------------------------------------------------------
-    # Starting far away (100 rs)
-    r_start = 100.0 * bh.rs
-
-    # Critical impact parameter for capture is b_crit = 3*sqrt(3) M_geo = 1.5*sqrt(3) rs ≈ 2.598 rs
-    b_crit = 1.5 * np.sqrt(3) * bh.rs
-    print("\nCritical photon impact parameter (capture) = {:.3f} rs".format(b_crit / bh.rs))
-
-    # Choose three impact parameters: below, at, and above the critical one
-    impact_params = [0.8 * b_crit, 1.0 * b_crit, 1.5 * b_crit]
-
-    fig, ax = plt.subplots(figsize=(6, 6))
-    colors = ['red', 'orange', 'green']
-    for b, col in zip(impact_params, colors):
-        traj_photon = bh.null_geodesic(
-            r0=r_start,
-            impact_parameter=b,
-            direction=-1,
-            tau_max=10.0,               # enough to see the turn‑around or capture
-        )
-        label = f"b = {b / bh.rs:.2f} rs"
-        bh.plot_trajectory(traj_photon, ax=ax, label=label,
-                            color=col, linewidth=1.2, show_horizon=False)
-    # Re‑draw the horizon once (so it sits on top)
-    bh.plot_trajectory(traj_photon, ax=ax, show_horizon=True, color='k', linewidth=0)
-
-    ax.set_title('Photon deflection – impact parameter vs. capture')
-    ax.legend()
-    plt.show()
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyle('Fusion')
+    
+    w = Widget()
+    w.setWindowTitle('Black Hole Simulator')
+    w.resize(1400, 800)
+    w.show()
+    
+    print("Black Hole Simulator")
+    print("Adjust number of photons and viewing angle, then click RUN SIMULATION\n")
+    
+    sys.exit(app.exec_())
+    w.show()
+    sys.exit(app.exec_())
